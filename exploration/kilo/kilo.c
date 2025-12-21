@@ -1,11 +1,143 @@
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
 
+/**
+ * Ctrl key strips bits 5 and 6 from whatever key you press in combination with
+ * it. We are duplicating that behaviour here by setting the top 3 bits to 0.
+ */
+#define CTRL_KEY(k) ((k) & 0x1F)
+
+#define KILO_VERSION "0.0.1"
+
+/*** Append Buffer ***/
+struct abuf {
+  char *buf;
+  int len;
+};
+
+// We're going vim mode boiz. Maybe not the FULL THING, but at least some
+// semblance of it.
+typedef enum { NORMAL, INSERT, VISUAL } Mode;
+
+// We're blaspheming as well. WERE ALIASING hjkl as arrow KEYS
+// :evil_laugh_if_thats_even_an_emote:
+enum editor_key {
+  ARROW_LEFT = 'h',
+  ARROW_RIGHT = 'l',
+  ARROW_UP = 'k',
+  ARROW_DOWN = 'j',
+};
+
+#define ABUF_INIT {NULL, 0}
+
+void abAppend(struct abuf *ab, const char *s, int len) {
+  char *new = realloc(ab->buf, ab->len + len);
+
+  if (new == NULL) {
+    return;
+  }
+  memcpy(&new[ab->len], s, len);
+  ab->buf = new;
+  ab->len += len;
+}
+
+void abFree(struct abuf *ab) { free(ab->buf); }
+
 /*** Data ***/
-struct termios original_attributes;
+struct editorConfig {
+  int cur_row;
+  int cur_col;
+  int screen_rows;
+  int screen_cols;
+  struct termios original_termios;
+  Mode mode;
+};
+
+struct editorConfig E;
+
+/*** utility ***/
+void hideCursor(struct abuf *ab) { abAppend(ab, "\x1b[?25l", 6); }
+
+void showCursor(struct abuf *ab) { abAppend(ab, "\x1b[?25h", 6); }
+
+void resetCrusorPosition(struct abuf *ab) {
+  // Reposition curosr to (1,1) (row, col).
+  // You can write it as \x1b[row;colH, to set it to (row, col) but the defaults
+  // are 1 so we don't need to specify them.
+  abAppend(ab, "\x1b[H", 3);
+}
+
+void moveCursor(int rows, int cols) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", rows, cols);
+  write(STDOUT_FILENO, buf, strlen(buf));
+}
+
+void moveCursorToCurrentPos() { moveCursor(E.cur_row + 1, E.cur_col + 1); }
+
+/**
+ * clearScreen - clears the screen
+ * \x1b[wJ: Is an escape sequence.
+ *    \x1b is the escape character (27), it's followed by '['.
+ *    2J tells the terminal to clear the whole screen.
+ *    1J would mean clear from top till the cursor.
+ *    0J would mean clear from cursor to bottom.
+ *    0, 1, and 2 are arguments.
+ */
+void clearScreen(struct abuf *ab) {
+  // Clear whole screen
+  abAppend(ab, "\x1b[2J", 4);
+  resetCrusorPosition(ab);
+}
+
+/*** output ***/
+void editorDrawRows(struct abuf *ab) {
+  int y;
+  for (y = 0; y < E.screen_rows; ++y) {
+    if (y == E.screen_rows / 3) {
+      char welcome[80];
+      int welcomelen = snprintf(welcome, sizeof(welcome),
+                                "Kilo editor -- version %s", KILO_VERSION);
+      if (welcomelen > E.screen_cols)
+        welcomelen = E.screen_cols;
+      int padding = (E.screen_cols - welcomelen) / 2;
+      if (padding) {
+        abAppend(ab, "~", 1);
+        padding--;
+      }
+      while (padding--) abAppend(ab, " ", 1);
+      abAppend(ab, welcome, welcomelen);
+    } else {
+      abAppend(ab, "~", 1);
+    }
+
+    abAppend(ab, "\x1b[K", 3);
+    if (y < E.screen_rows - 1) {
+      abAppend(ab, "\r\n", 2);
+    }
+  }
+}
+
+void editorRefreshScreen() {
+  struct abuf ab = ABUF_INIT;
+
+  hideCursor(&ab);
+  resetCrusorPosition(&ab);
+  editorDrawRows(&ab);
+  resetCrusorPosition(&ab);
+  E.cur_row = 0;
+  E.cur_col = 0;
+  showCursor(&ab);
+
+  write(STDOUT_FILENO, ab.buf, ab.len);
+  abFree(&ab);
+}
 
 /*** Terminal Attributes and Configuration ***/
 /**
@@ -13,6 +145,10 @@ struct termios original_attributes;
  * @s: String error to be outputted, with the perror.
  */
 void die(const char *s) {
+  struct abuf ab = ABUF_INIT;
+  clearScreen(&ab);
+  abFree(&ab);
+
   perror(s);
   exit(1);
 }
@@ -26,7 +162,7 @@ void die(const char *s) {
  * the user had configured.
  */
 void disableRawMode() {
-  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_attributes) == -1) {
+  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.original_termios) == -1) {
     die("tcsetattr");
   }
 }
@@ -41,14 +177,13 @@ void disableRawMode() {
  */
 void enableRawMode() {
   // Get the attributes, and populate them in the raw variable.
-  if (tcgetattr(STDIN_FILENO, &original_attributes) == -1) {
+  if (tcgetattr(STDIN_FILENO, &E.original_termios) == -1) {
     die("tcgetattr");
   }
-
   // Before exiting we need to reset to the original attributes.
   atexit(disableRawMode);
 
-  struct termios new_attributes = original_attributes;
+  struct termios new_attributes = E.original_termios;
 
   // IXON: Disables Ctrl-S and Ctrl-Q. Ctrl-S stops data from being transmitted
   // to the terminal until you press Ctrl-Q
@@ -112,30 +247,165 @@ void enableRawMode() {
   }
 }
 
-/*** Init ***/
-int main() {
-  enableRawMode();
-
+char editorReadKey() {
+  int nread;
   char c;
-  // STDIN_FILENO is an int with value 0. Typically
-
-  while (1) {
-    char c = '\0';
-    if (read(STDIN_FILENO, &c, 1)) {
+  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+    if (nread == -1 && errno != EAGAIN) {
       die("read");
     }
+  }
 
-    // Check for control characters. ASCII 0-31 are control characters and are
-    // not printable.
-    if (iscntrl(c)) {
-      printf("%d\r\n", c);
-    } else {
-      // Print decimal number and a character.
+  if (c == '\x1b') {
+    char seq[3];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1) {
+      printf("didn't read the 1st byte");
+      return '\x1b';
+    }
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) {
+      printf("didn't read the 2nd byte");
+      return '\x1b';
+    }
+    if (seq[0] == '[') {
+      printf("%c, %c", seq[1], seq[2]);
+      switch (seq[1]) {
+      case 'A':
+        return ARROW_UP;
+      case 'B':
+        return ARROW_DOWN;
+      case 'C':
+        return ARROW_RIGHT;
+      case 'D':
+        return ARROW_LEFT;
+      }
+    }
+    return '\x1b';
+  } else {
+    return c;
+  }
+  return c;
+}
+
+void editorProcessKeypress() {
+  char c = editorReadKey();
+
+  if (E.mode == NORMAL) {
+    switch (c) {
+    case ARROW_DOWN:
+      if (E.cur_row < E.screen_rows)
+        E.cur_row++;
+      moveCursorToCurrentPos();
+      break;
+    case ARROW_UP:
+      if (E.cur_row > 0)
+        E.cur_row--;
+      moveCursorToCurrentPos();
+      break;
+    case ARROW_RIGHT:
+      if (E.cur_col < E.screen_cols)
+        E.cur_col++;
+      moveCursorToCurrentPos();
+      break;
+    case ARROW_LEFT:
+      if (E.cur_col > 0)
+        E.cur_col--;
+      moveCursorToCurrentPos();
+      break;
+    case 'i':
+      E.mode = INSERT;
+      break;
+    case CTRL_KEY('q'):
+      exit(0);
+      break;
+    case CTRL_KEY('r'):
+      editorRefreshScreen();
+      break;
+    default:
+      printf("%d ('%c')\r\n", c, c);
+      break;
+    }
+  }
+
+  if (E.mode == INSERT) {
+    switch (c) {
+    case '\x1b':
+      E.mode = NORMAL;
+      break;
+    case CTRL_KEY('q'):
+      exit(0);
+      break;
+    case CTRL_KEY('r'):
+      editorRefreshScreen();
+      break;
+    default:
       printf("%d ('%c')\r\n", c, c);
     }
+  }
+}
 
-    if (c == 'q')
+int getCursorPosition(int *rows, int *cols) {
+  char buf[32];
+  unsigned int i = 0;
+
+  if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4) {
+    return -1;
+  }
+
+  while (i < sizeof(buf) - 1) {
+    if (read(STDIN_FILENO, &buf[i], 1) != 1) {
       break;
+    }
+    if (buf[i] == 'R') {
+      break;
+    }
+    ++i;
+  }
+
+  if (buf[0] != '\x1b' || buf[1] != '[') {
+    return -1;
+  }
+
+  // We're tellig sscanf that the buffer will be of type: int followed by a
+  // semicolon followed by an int. And we want the two int values assigned to
+  // rows and cols respectively.
+  if (sscanf(&buf[2], "%d;%d", rows, cols)) {
+    return -1;
+  }
+
+  return 0;
+}
+
+int getWindowSize(int *rows, int *cols) {
+  struct winsize ws;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+    if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12) {
+      return -1;
+    }
+    getCursorPosition(rows, cols);
+  } else {
+    *cols = ws.ws_col;
+    *rows = ws.ws_row;
+    return 0;
+  }
+  return -1;
+};
+
+/*** Init ***/
+void initEditor() {
+  E.cur_row = 0;
+  E.cur_col = 0;
+  E.mode = NORMAL;
+  if (getWindowSize(&E.screen_rows, &E.screen_cols) == -1) {
+    die("getWindowSize");
+  }
+}
+
+int main() {
+  enableRawMode();
+  initEditor();
+
+  while (1) {
+    editorProcessKeypress();
   };
 
   return 0;
