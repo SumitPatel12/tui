@@ -8,17 +8,37 @@
 struct termios original_attributes;
 
 /*** Terminal Attributes and Configuration ***/
+/**
+ * die: Prints out an error and exits the process.
+ * @s: String error to be outputted, with the perror.
+ */
 void die(const char *s) {
   perror(s);
   exit(1);
 }
 
+/**
+ * disableRawMode: Restores terminal to original attributes.
+ *
+ * Resets the terminal attributes back to what they were before enableRawMode
+ * was called. This is necessary because we modify many flags, and without
+ * resetting, the terminal would remain in the state we set instead of what
+ * the user had configured.
+ */
 void disableRawMode() {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_attributes) == -1) {
     die("tcsetattr");
   }
 }
 
+/**
+ * enableRawMode: Configures the terminal for raw mode operation.
+ *
+ * Saves the current terminal attributes and then modifies them to enable raw
+ * mode by disabling echo, canonical mode, signals, and various input/output
+ * processing features. Registers disableRawMode to be called at exit to
+ * restore original terminal settings.
+ */
 void enableRawMode() {
   // Get the attributes, and populate them in the raw variable.
   if (tcgetattr(STDIN_FILENO, &original_attributes) == -1) {
