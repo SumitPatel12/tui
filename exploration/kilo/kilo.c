@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <wchar.h>
 
 /**
  * Ctrl key strips bits 5 and 6 from whatever key you press in combination with
@@ -15,6 +16,11 @@
 
 #define KILO_VERSION "0.0.1"
 
+typedef struct erow {
+  int size;
+  char *contents;
+} erow;
+
 /*** Append Buffer ***/
 struct abuf {
   char *buf;
@@ -23,7 +29,7 @@ struct abuf {
 
 // We're going vim mode boiz. Maybe not the FULL THING, but at least some
 // semblance of it.
-typedef enum { NORMAL, INSERT, VISUAL } Mode;
+typedef enum { NORMAL, INSERT, VISUAL } mode;
 
 // We're blaspheming as well. WERE ALIASING hjkl as arrow KEYS
 // :evil_laugh_if_thats_even_an_emote:
@@ -56,7 +62,10 @@ struct editorConfig {
   int screen_rows;
   int screen_cols;
   struct termios original_termios;
-  Mode mode;
+  mode mode;
+  int num_rows;
+  int row_capacity;
+  erow *rows;
 };
 
 struct editorConfig E;
@@ -100,23 +109,15 @@ void clearScreen(struct abuf *ab) {
 void editorDrawRows(struct abuf *ab) {
   int y;
   for (y = 0; y < E.screen_rows; ++y) {
-    if (y == E.screen_rows / 3) {
-      char welcome[80];
-      int welcomelen = snprintf(welcome, sizeof(welcome),
-                                "Kilo editor -- version %s", KILO_VERSION);
-      if (welcomelen > E.screen_cols)
-        welcomelen = E.screen_cols;
-      int padding = (E.screen_cols - welcomelen) / 2;
-      if (padding) {
-        abAppend(ab, "~", 1);
-        padding--;
+    if (y < E.num_rows) {
+      int len = E.rows[y].size;
+      if (len > E.screen_cols) {
+        len = E.screen_cols;
       }
-      while (padding--) abAppend(ab, " ", 1);
-      abAppend(ab, welcome, welcomelen);
+      abAppend(ab, E.rows[y].contents, len);
     } else {
       abAppend(ab, "~", 1);
     }
-
     abAppend(ab, "\x1b[K", 3);
     if (y < E.screen_rows - 1) {
       abAppend(ab, "\r\n", 2);
@@ -140,6 +141,15 @@ void editorRefreshScreen() {
 }
 
 /*** Terminal Attributes and Configuration ***/
+void editorFree() {
+  if (E.rows != NULL) {
+    for (int i = 0; i < E.num_rows; i++) {
+      free(E.rows[i].contents);
+    }
+    free(E.rows);
+  }
+}
+
 /**
  * die: Prints out an error and exits the process.
  * @s: String error to be outputted, with the perror.
@@ -149,6 +159,7 @@ void die(const char *s) {
   clearScreen(&ab);
   abFree(&ab);
 
+  editorFree();
   perror(s);
   exit(1);
 }
@@ -321,7 +332,6 @@ void editorProcessKeypress() {
       editorRefreshScreen();
       break;
     default:
-      printf("%d ('%c')\r\n", c, c);
       break;
     }
   }
@@ -390,19 +400,73 @@ int getWindowSize(int *rows, int *cols) {
   return -1;
 };
 
+/*** Row Operations ***/
+void editorAppendRow(char *s, size_t len) {
+  if (E.num_rows >= E.row_capacity) {
+    int new_capacity = E.row_capacity == 0 ? 16 : E.row_capacity * 2;
+    E.rows = realloc(E.rows, sizeof(erow) * new_capacity);
+    if (E.rows == NULL) {
+      die("realloc rows");
+    }
+    E.row_capacity = new_capacity;
+  }
+
+  int at = E.num_rows;
+  E.rows[at].size = len;
+  E.rows[at].contents = malloc(len + 1);
+  if (E.rows[at].contents == NULL) {
+    die("malloc row contents");
+  }
+  memcpy(E.rows[at].contents, s, len);
+  E.rows[at].contents[len] = '\0';
+  E.num_rows++;
+}
+
 /*** Init ***/
 void initEditor() {
   E.cur_row = 0;
   E.cur_col = 0;
   E.mode = NORMAL;
+  E.num_rows = 0;
+  E.row_capacity = 0;
+  E.rows = NULL;
   if (getWindowSize(&E.screen_rows, &E.screen_cols) == -1) {
     die("getWindowSize");
   }
+  atexit(editorFree);
 }
 
-int main() {
+void editorOpen(char *filename) {
+  FILE *fp = fopen(filename, "r");
+  if (!fp) {
+    die("fopen");
+  }
+
+  char *line = NULL;
+  size_t linecap = 0;
+  ssize_t linelen;
+  while ((linelen = getline(&line, &linecap, fp)) != -1) {
+    while (linelen > 0 &&
+           (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) {
+      linelen--;
+    }
+    editorAppendRow(line, linelen);
+  }
+  free(line);
+  fclose(fp);
+}
+
+int main(int argc, char *argv[]) {
+  if (argc < 2) {
+    fprintf(stderr, "Usage: kilo <filename>\n");
+    exit(1);
+  }
+
   enableRawMode();
   initEditor();
+  editorOpen(argv[1]);
+
+  editorRefreshScreen();
 
   while (1) {
     editorProcessKeypress();
