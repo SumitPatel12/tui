@@ -59,6 +59,7 @@ void abFree(struct abuf *ab) { free(ab->buf); }
 struct editorConfig {
   int cur_row;
   int cur_col;
+  int row_offset;
   int screen_rows;
   int screen_cols;
   struct termios original_termios;
@@ -88,7 +89,7 @@ void moveCursor(int rows, int cols) {
   write(STDOUT_FILENO, buf, strlen(buf));
 }
 
-void moveCursorToCurrentPos() { moveCursor(E.cur_row + 1, E.cur_col + 1); }
+void moveCursorToCurrentPos() { moveCursor((E.cur_row - E.row_offset) + 1, E.cur_col + 1); }
 
 /**
  * clearScreen - clears the screen
@@ -109,12 +110,13 @@ void clearScreen(struct abuf *ab) {
 void editorDrawRows(struct abuf *ab) {
   int y;
   for (y = 0; y < E.screen_rows; ++y) {
-    if (y < E.num_rows) {
-      int len = E.rows[y].size;
+    int file_row = y + E.row_offset;
+    if (file_row < E.num_rows) {
+      int len = E.rows[file_row].size;
       if (len > E.screen_cols) {
         len = E.screen_cols;
       }
-      abAppend(ab, E.rows[y].contents, len);
+      abAppend(ab, E.rows[file_row].contents, len);
     } else {
       abAppend(ab, "~", 1);
     }
@@ -125,15 +127,32 @@ void editorDrawRows(struct abuf *ab) {
   }
 }
 
+int editorScroll() {
+  int scrolled = 0;
+  if (E.cur_row < E.row_offset) {
+    E.row_offset = E.cur_row;
+    scrolled = 1;
+  }
+  if (E.cur_row >= E.row_offset + E.screen_rows) {
+    E.row_offset = E.cur_row - E.screen_rows + 1;
+    scrolled = 1;
+  }
+  return scrolled;
+}
+
 void editorRefreshScreen() {
+  editorScroll();
+
   struct abuf ab = ABUF_INIT;
 
   hideCursor(&ab);
   resetCrusorPosition(&ab);
   editorDrawRows(&ab);
-  resetCrusorPosition(&ab);
-  E.cur_row = 0;
-  E.cur_col = 0;
+
+  char buf[32];
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cur_row - E.row_offset) + 1, E.cur_col + 1);
+  abAppend(&ab, buf, strlen(buf));
+
   showCursor(&ab);
 
   write(STDOUT_FILENO, ab.buf, ab.len);
@@ -303,17 +322,25 @@ void editorProcessKeypress() {
   if (E.mode == NORMAL) {
     switch (c) {
     case ARROW_DOWN:
-      if (E.cur_row < E.screen_rows)
+      if (E.cur_row < E.num_rows - 1)
         E.cur_row++;
-      moveCursorToCurrentPos();
+      if (editorScroll()) {
+        editorRefreshScreen();
+      } else {
+        moveCursorToCurrentPos();
+      }
       break;
     case ARROW_UP:
       if (E.cur_row > 0)
         E.cur_row--;
-      moveCursorToCurrentPos();
+      if (editorScroll()) {
+        editorRefreshScreen();
+      } else {
+        moveCursorToCurrentPos();
+      }
       break;
     case ARROW_RIGHT:
-      if (E.cur_col < E.screen_cols)
+      if (E.cur_col < E.screen_cols - 1)
         E.cur_col++;
       moveCursorToCurrentPos();
       break;
@@ -426,6 +453,7 @@ void editorAppendRow(char *s, size_t len) {
 void initEditor() {
   E.cur_row = 0;
   E.cur_col = 0;
+  E.row_offset = 0;
   E.mode = NORMAL;
   E.num_rows = 0;
   E.row_capacity = 0;
