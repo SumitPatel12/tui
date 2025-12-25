@@ -107,6 +107,7 @@ void moveCursorToCurrentPos() {
  *    0, 1, and 2 are arguments.
  */
 void clearScreen(struct abuf *ab) {
+  abAppend(ab, "\x1b[48;2;40;40;40m", 16); // Set background #282828
   // Clear whole screen
   abAppend(ab, "\x1b[2J", 4);
   resetCrusorPosition(ab);
@@ -152,6 +153,7 @@ void editorRefreshScreen() {
   struct abuf ab = ABUF_INIT;
 
   hideCursor(&ab);
+  abAppend(&ab, "\x1b[48;2;40;40;40m", 16); // Set background #282828
   resetCrusorPosition(&ab);
   editorDrawRows(&ab);
 
@@ -199,6 +201,7 @@ void die(const char *s) {
  * the user had configured.
  */
 void disableRawMode() {
+  write(STDOUT_FILENO, "\x1b[0m", 4); // Reset colors
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.original_termios) == -1) {
     die("tcsetattr");
   }
