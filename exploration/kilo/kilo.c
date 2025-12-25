@@ -18,7 +18,9 @@
 
 typedef struct erow {
   int size;
+  int rsize;
   char *contents;
+  char *render;
 } erow;
 
 /*** Append Buffer ***/
@@ -41,6 +43,8 @@ enum editor_key {
 };
 
 #define ABUF_INIT {NULL, 0}
+
+void editorAppendRow(char *s, size_t len);
 
 void abAppend(struct abuf *ab, const char *s, int len) {
   char *new = realloc(ab->buf, ab->len + len);
@@ -89,7 +93,9 @@ void moveCursor(int rows, int cols) {
   write(STDOUT_FILENO, buf, strlen(buf));
 }
 
-void moveCursorToCurrentPos() { moveCursor((E.cur_row - E.row_offset) + 1, E.cur_col + 1); }
+void moveCursorToCurrentPos() {
+  moveCursor((E.cur_row - E.row_offset) + 1, E.cur_col + 1);
+}
 
 /**
  * clearScreen - clears the screen
@@ -150,7 +156,8 @@ void editorRefreshScreen() {
   editorDrawRows(&ab);
 
   char buf[32];
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cur_row - E.row_offset) + 1, E.cur_col + 1);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cur_row - E.row_offset) + 1,
+           E.cur_col + 1);
   abAppend(&ab, buf, strlen(buf));
 
   showCursor(&ab);
@@ -316,6 +323,42 @@ char editorReadKey() {
   return c;
 }
 
+void editorUpdateRow(erow *row) {
+  free(row->render);
+  row->render = malloc(row->size + 1);
+
+  int j;
+  int idx = 0;
+
+  for (j = 0; j < row->size; ++j) {
+    row->render[idx++] = row->contents[j];
+  }
+
+  row->render[idx] = '\0';
+  row->rsize = idx;
+}
+
+void editorRowInsertChar(erow *row, int at, int c) {
+  // Since we're letting them insert the character it can be at the very end of
+  // the row thuse we allow row->size.
+  if (at < 0 || at > row->size) {
+    at = row->size;
+  }
+
+  // Plus 2 because one for the character being inserted and one for the null
+  // termination character at the end of the line.
+  row->contents = realloc(row->contents, row->size + 2);
+
+  // Essentially shift everything after index at by 1 to make space for the
+  // newly inserted character. This is quite inefficient. People generally use
+  // gap buffers for things like this.
+  memmove(&row->contents[at + 1], &row->contents[at], row->size - at + 1);
+  row->contents[at] = c;
+
+  row->size++;
+  editorUpdateRow(row);
+}
+
 void editorProcessKeypress() {
   char c = editorReadKey();
 
@@ -340,7 +383,7 @@ void editorProcessKeypress() {
       }
       break;
     case ARROW_RIGHT:
-      if (E.cur_col < E.screen_cols - 1)
+      if (E.num_rows > 0 && E.cur_col < E.rows[E.cur_row].size)
         E.cur_col++;
       moveCursorToCurrentPos();
       break;
@@ -363,7 +406,7 @@ void editorProcessKeypress() {
     }
   }
 
-  if (E.mode == INSERT) {
+  else if (E.mode == INSERT) {
     switch (c) {
     case '\x1b':
       E.mode = NORMAL;
@@ -375,7 +418,13 @@ void editorProcessKeypress() {
       editorRefreshScreen();
       break;
     default:
-      printf("%d ('%c')\r\n", c, c);
+      if (E.num_rows == 0) {
+        editorAppendRow("", 0);
+      }
+      editorRowInsertChar(&E.rows[E.cur_row], E.cur_col, c);
+      E.cur_col++;
+      editorRefreshScreen();
+      break;
     }
   }
 }
@@ -446,6 +495,11 @@ void editorAppendRow(char *s, size_t len) {
   }
   memcpy(E.rows[at].contents, s, len);
   E.rows[at].contents[len] = '\0';
+
+  E.rows[at].rsize = 0;
+  E.rows[at].render = NULL;
+  editorUpdateRow(&E.rows[at]);
+
   E.num_rows++;
 }
 
